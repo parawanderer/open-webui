@@ -535,6 +535,46 @@ async def get_ollama_loaded_models(
     return {'models': merge_models_lists(r.get('models', []) if r else None for r in responses)}
 
 
+@router.get('/api/info')
+async def get_ollama_info(
+    request: Request,
+    user=Depends(get_admin_user),
+    skip_idxs: set[int] | None = None,
+) -> dict:
+    """Return Ollama runtime info: version, model store totals and per-device compute capacity.
+
+    Unlike /api/ps this payload is not a list that can be concatenated. It is shaped
+    {version, models{...}, compute{system_compute{...}, supported_gpus[...]}}, and each of
+    its scalars describes one host, so merging several backends would mean inventing a rule
+    for them. The first backend that answers is therefore returned unmerged.
+    """
+    if not await Config.get('ollama.enable'):
+        return {}
+
+    tasks = []
+    base_urls = await Config.get('ollama.base_urls', [])
+    api_configs = await Config.get('ollama.api_configs', {})
+    for idx, url in enumerate(base_urls):
+        if skip_idxs and idx in skip_idxs:
+            tasks.append(asyncio.ensure_future(asyncio.sleep(0, None)))
+            continue
+        api_config = resolve_api_config(api_configs, idx, url)
+        if not api_config:
+            tasks.append(send_get_request(f'{url}/api/info', user=user))
+        elif api_config.get('enable', True):
+            tasks.append(send_get_request(f'{url}/api/info', api_config.get('key'), user=user))
+        else:
+            tasks.append(asyncio.ensure_future(asyncio.sleep(0, None)))
+
+    responses = await asyncio.gather(*tasks)
+
+    for response in responses:
+        if response:
+            return response
+
+    return {}
+
+
 @router.get('/api/version')
 @router.get('/api/version/{url_idx}')
 async def get_ollama_versions(
