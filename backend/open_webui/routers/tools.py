@@ -498,10 +498,14 @@ class ToolCallForm(BaseModel):
     stream: bool = False
 
 
-# Cap on the tool output streamed to a caller, in characters. A tool looping on its
+# Cap on everything streamed to a caller for one call, in characters. A tool looping on its
 # progress emitter should become a display problem rather than a network one. The head is
 # kept, since the first output is nearly always the useful part, and the result frame's
-# `truncated` counts the characters dropped after it.
+# `truncated` counts what was dropped after it.
+#
+# Event frames are measured against it too. They were assumed to be small and structural,
+# which is wrong: a `citation` carries document text and is routinely the largest payload in
+# a run, so leaving them uncapped left the dominant one unbounded.
 TOOL_STREAM_OUTPUT_CAP = 100_000
 
 
@@ -606,7 +610,7 @@ async def resolve_tool_call(
 def clip_stream_text(text: str, streamed: int) -> tuple[str, int]:
     """Clip a text delta to whatever is left of the streamed-output cap.
 
-    :param streamed: characters already streamed for this call.
+    :param streamed: characters already streamed for this call, event frames included.
     :returns: `(text to send, characters dropped)`.
     """
     room = max(TOOL_STREAM_OUTPUT_CAP - streamed, 0)
@@ -620,7 +624,8 @@ def tool_result_frame(tool_id, name, value, error, duration_ms: int, queued_ms: 
 
     :param duration_ms: how long this server spent evaluating the tool.
     :param queued_ms: how long it spent resolving the tool before evaluating it.
-    :param dropped: characters of output the cap discarded, reported only when there were any.
+    :param dropped: characters the cap discarded, output clipped and event frames dropped
+        whole alike, reported only when there were any.
     """
     frame = {
         'type': 'result',
@@ -710,7 +715,14 @@ async def stream_tool_call(tool_id: str, name: str, invoke, aclose, events: asyn
 
             text = get_tool_event_text(event)
             if text is None:
-                yield JSONCodec.dumps({'type': 'event', 'event': event, 'atMs': at_ms()}) + '\n'
+                # Whole or not at all: a structural payload truncated in half is not something a
+                # client can parse, so an event frame that no longer fits is dropped and counted.
+                frame = JSONCodec.dumps({'type': 'event', 'event': event, 'atMs': at_ms()})
+                if len(frame) > TOOL_STREAM_OUTPUT_CAP - streamed:
+                    dropped += len(frame)
+                    continue
+                streamed += len(frame)
+                yield frame + '\n'
                 continue
 
             # A frame carries a delta, never the accumulated text, so a dropped connection
