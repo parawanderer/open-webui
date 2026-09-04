@@ -604,8 +604,12 @@ async def stream_ollama_events(
         api_config = resolve_api_config(api_configs, idx, url)
         if api_config and not api_config.get('enable', True):
             continue
+        # Forward the query string. ?since= asks the backend to replay retained history,
+        # and dropping it silently turns a reconnect into a gap the client cannot see --
+        # it receives a stream that looks healthy and simply has no history in it.
+        query = request.url.query
         return await send_request(
-            f'{url}/api/events',
+            f'{url}/api/events' + (f'?{query}' if query else ''),
             'GET',
             key=api_config.get('key') if api_config else None,
             user=user,
