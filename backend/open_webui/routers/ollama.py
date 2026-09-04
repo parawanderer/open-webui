@@ -580,6 +580,43 @@ async def get_ollama_info(
     return {}
 
 
+@router.get('/api/events')
+async def stream_ollama_events(
+    request: Request,
+    user=Depends(get_admin_user),
+):
+    """Proxy Ollama's model lifecycle event stream.
+
+    Unlike the other routes here this one is long-lived and mostly idle: it emits a frame
+    when a model loads, is evicted or unloads, and a heartbeat in between. It is proxied
+    rather than merged because the events describe one host's scheduler, the same reason
+    /api/info returns a single backend's answer.
+
+    The response is streamed straight through with no buffering, so a frame reaches the
+    client when the backend produced it rather than when the connection closes.
+    """
+    if not await Config.get('ollama.enable'):
+        raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
+
+    base_urls = await Config.get('ollama.base_urls', [])
+    api_configs = await Config.get('ollama.api_configs', {})
+    for idx, url in enumerate(base_urls):
+        api_config = resolve_api_config(api_configs, idx, url)
+        if api_config and not api_config.get('enable', True):
+            continue
+        return await send_request(
+            f'{url}/api/events',
+            'GET',
+            key=api_config.get('key') if api_config else None,
+            user=user,
+            stream=True,
+            passthrough=True,
+            content_type='application/x-ndjson',
+        )
+
+    raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_NOT_FOUND)
+
+
 @router.get('/api/version')
 @router.get('/api/version/{url_idx}', dependencies=[Depends(get_admin_user)])
 async def get_ollama_versions(
