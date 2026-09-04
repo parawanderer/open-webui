@@ -519,25 +519,42 @@ def get_tool_event_text(event) -> str | None:
     are purely structural and have no text at all. The last are streamed on verbatim as
     `event` frames rather than dropped.
 
-    :param event: the payload the tool passed to `__event_emitter__`.
+    An MCP-backed tool reports through its own connection instead, and the two kinds divide
+    the same way: a log notification is output, while progress is a number that must
+    increase plus a status line, which belongs beside the output rather than inside it.
+
+    :param event: the payload the tool passed to `__event_emitter__`, or a notification
+        `MCPClient.listen` forwarded.
     :returns: the text to stream, or None when the event carries none.
     """
     if not isinstance(event, dict):
         return None
 
+    event_type = event.get('type')
     data = event.get('data')
+
+    if event_type == 'mcp:log':
+        # A log notification's data is any JSON value, and only a server knows which.
+        text = data if isinstance(data, str) else None if data is None else JSONCodec.dumps(data)
+        return text or None
+
     if not isinstance(data, dict):
         return None
 
-    text = data.get('description') if event.get('type') == 'status' else data.get('content')
+    text = data.get('description') if event_type == 'status' else data.get('content')
     return text if isinstance(text, str) and text else None
 
 
-async def resolve_tool_call(request: Request, id: str, form_data: ToolCallForm, user, extra_params: dict):
+async def resolve_tool_call(
+    request: Request, id: str, form_data: ToolCallForm, user, extra_params: dict, events: asyncio.Queue | None = None
+):
     """Resolve a tool id and function name to the callable the chat pipeline would invoke.
 
     :param id: the tool bundle, which selects a local tool, an OpenAPI tool server, or an
         MCP server; `form_data.name` selects the function within it.
+    :param events: where progress is collected, or None when the caller is not streaming.
+        A local tool reports through `__event_emitter__` in `extra_params`; an MCP server
+        reports over its own connection, which has to be told to listen.
     :returns: `(tool_id, name, invoke, aclose)`, where `invoke()` awaits the call and
         `aclose` releases whatever resolution opened, or is None when it opened nothing.
     """
@@ -569,6 +586,9 @@ async def resolve_tool_call(request: Request, id: str, form_data: ToolCallForm, 
         except Exception:
             await client.disconnect()
             raise
+
+        if events is not None:
+            await client.listen(events.put)
 
         return id, name, partial(client.call_tool, name, function_args=form_data.arguments), client.disconnect
 
@@ -779,7 +799,9 @@ async def execute_tool_by_id(
         '__message_id__': None,
     }
 
-    tool_id, name, invoke, aclose = await resolve_tool_call(request, id, form_data, user, extra_params)
+    tool_id, name, invoke, aclose = await resolve_tool_call(
+        request, id, form_data, user, extra_params, events if form_data.stream else None
+    )
 
     if form_data.stream:
         return StreamingResponse(

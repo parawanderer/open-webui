@@ -60,6 +60,67 @@ class MCPClient:
     def __init__(self):
         self.session: Optional[ClientSession] = None
         self.exit_stack = None
+        # Set by listen(). None means nothing is watching, which is also why no progress
+        # token is attached to a call: asking a server to report progress nobody reads
+        # costs it work and the transport bandwidth.
+        self._notify = None
+
+    async def listen(self, sink, level: str = 'info') -> None:
+        """Route this connection's log and progress notifications to `sink`.
+
+        A tools/call over the streaming transport may be preceded by notifications scoped to
+        it, which is the only way to see a long call working. Nothing received them before,
+        so a server that faithfully reported a two-minute call had every notification
+        dropped one layer below whoever wanted it.
+
+        Logging is a session-wide setting in MCP (`logging/setLevel`), not a per-request one,
+        so the level is raised here rather than at connect: a connection nobody is watching
+        asks the server for nothing.
+
+        :param sink: an async callable taking one notification dict, either
+            `{'type': 'mcp:log', 'level', 'logger', 'data'}` or
+            `{'type': 'mcp:progress', 'progress', 'total', 'message'}`.
+        :param level: the minimum log level to request, or falsy to leave it alone.
+        """
+        self._notify = sink
+
+        capabilities = self.session.get_server_capabilities() if self.session else None
+        if not level or capabilities is None or capabilities.logging is None:
+            return
+
+        try:
+            await self.session.set_logging_level(level)
+        except Exception as e:
+            # Advertising the capability and accepting a given level are different things,
+            # and a refusal is not a reason to fail the call that is about to run.
+            log.debug(f'MCP server declined log level {level}: {e}')
+
+    def stop_listening(self) -> None:
+        """Stop routing notifications. Calls after this attach no progress token again."""
+        self._notify = None
+
+    async def _emit(self, notification: dict) -> None:
+        if self._notify is None:
+            return
+
+        try:
+            await self._notify(notification)
+        except Exception:
+            # A consumer that breaks must not take the tool call down with it.
+            log.exception('MCP notification sink failed')
+
+    async def _on_log(self, params) -> None:
+        await self._emit(
+            {
+                'type': 'mcp:log',
+                'level': params.level,
+                'logger': params.logger,
+                'data': params.data,
+            }
+        )
+
+    async def _on_progress(self, progress: float, total: float | None, message: str | None) -> None:
+        await self._emit({'type': 'mcp:progress', 'progress': progress, 'total': total, 'message': message})
 
     async def connect(self, url: str, headers: Optional[dict] = None):
         async with AsyncExitStack() as exit_stack:
@@ -75,7 +136,12 @@ class MCPClient:
                 transport = await exit_stack.enter_async_context(self._streams_context)
                 read_stream, write_stream, _ = transport
 
-                self._session_context = ClientSession(read_stream, write_stream)  # pylint: disable=W0201
+                # The transport streams; without a callback there is nothing to receive on.
+                self._session_context = ClientSession(  # pylint: disable=W0201
+                    read_stream,
+                    write_stream,
+                    logging_callback=self._on_log,
+                )
 
                 self.session = await exit_stack.enter_async_context(self._session_context)
                 with anyio.fail_after(MCP_INITIALIZE_TIMEOUT):
@@ -110,7 +176,13 @@ class MCPClient:
         if not self.session:
             raise RuntimeError('MCP client is not connected.')
 
-        result = await self.session.call_tool(function_name, function_args)
+        # The SDK mints the progress token when a callback is given, so passing one only
+        # while something is listening is also what opts this call into progress at all.
+        result = await self.session.call_tool(
+            function_name,
+            function_args,
+            progress_callback=self._on_progress if self._notify else None,
+        )
         if not result:
             raise Exception('No result returned from MCP tool call.')
 
