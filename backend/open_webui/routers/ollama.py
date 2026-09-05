@@ -100,6 +100,11 @@ async def send_request(
     # passthrough must stay False for /api/chat: middleware parses it per line
     passthrough: bool = False,
     content_type: str | None = None,
+    # Accept is forwarded rather than synthesised so a client can negotiate a response
+    # encoding with the backend through this proxy. ollama-slop offers its chat stream as
+    # length-delimited protobuf for Accept: application/protobuf, which is ~22x smaller than
+    # the SSE JSON; without this the backend never learns the client asked.
+    accept: str | None = None,
     metadata: dict | None = None,
     api_config: dict | None = None,
     request: Request | None = None,
@@ -110,6 +115,8 @@ async def send_request(
         session = await get_session()
 
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
+        if accept:
+            headers['Accept'] = accept
 
         r = await session.request(
             method,
@@ -1366,6 +1373,7 @@ async def generate_openai_completion(
         user=user,
         stream=payload.get('stream', False),
         passthrough=True,
+        accept=request.headers.get('accept'),
         metadata=metadata,
         api_config=api_config,
         request=request,
@@ -1472,6 +1480,7 @@ async def generate_openai_chat_completion(
         user=user,
         stream=payload.get('stream', False),
         passthrough=True,
+        accept=request.headers.get('accept'),
         metadata=metadata,
         api_config=api_config,
         request=request,
