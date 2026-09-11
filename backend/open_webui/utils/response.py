@@ -262,6 +262,11 @@ async def convert_streaming_response_ollama_to_openai(ollama_streaming_response)
         usage = None
         if done:
             usage = convert_ollama_usage_to_openai(data)
+        elif 'eval_count' in data:
+            # Ollama puts its running count on a chunk only when the request asked
+            # (stream_options.continuous_usage_stats -> stream_metrics). Passed on as usage
+            # on that chunk, which is how vLLM reports it.
+            usage = convert_ollama_usage_to_openai(data)
 
         data = openai_chat_chunk_message_template(
             model, message_content, reasoning_content, openai_tool_calls, usage, message_id=completion_id

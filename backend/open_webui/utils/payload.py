@@ -379,9 +379,16 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
     if 'tools' in openai_payload:
         ollama_payload['tools'] = openai_payload['tools']
 
-    if 'max_tokens' in openai_payload:
-        ollama_payload['num_predict'] = openai_payload['max_tokens']
-        del openai_payload['max_tokens']
+    # Ollama reads num_predict from options only; at the root of the payload it is ignored,
+    # so a client's max_tokens used to have no effect at all (12 asked, 4,889 generated).
+    # Applied after options are built below, and without overriding an explicit option.
+    max_tokens = openai_payload.pop('max_tokens', None)
+
+    # A running token count on every streamed chunk, when the client asks for it the way
+    # vLLM spells it. Ollama's native name is stream_metrics.
+    stream_options = openai_payload.get('stream_options') or {}
+    if ollama_payload['stream'] and stream_options.get('continuous_usage_stats'):
+        ollama_payload['stream_metrics'] = True
 
     # If there are advanced parameters in the payload, format them in Ollama's options field
     if openai_payload.get('options'):
@@ -429,6 +436,9 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
         ollama_options = ollama_payload.get('options', {})
         ollama_options['stop'] = openai_payload.get('stop')
         ollama_payload['options'] = ollama_options
+
+    if max_tokens is not None:
+        ollama_payload.setdefault('options', {}).setdefault('num_predict', max_tokens)
 
     if 'metadata' in openai_payload:
         ollama_payload['metadata'] = openai_payload['metadata']
