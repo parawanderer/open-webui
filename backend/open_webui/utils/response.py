@@ -204,6 +204,17 @@ def convert_ollama_usage_to_openai(data: dict) -> dict:
             'accepted_prediction_tokens': 0,
             'rejected_prediction_tokens': 0,
         },
+        # How much of the prompt ollama's prefix cache served, in OpenAI's standard slot.
+        # Only when ollama reported it: 0 is a cold prefill and absent is "not reported",
+        # and defaulting a missing count to 0 would turn the second into the first.
+        **(
+            {
+                'prompt_tokens_details': {'cached_tokens': int(data['prompt_eval_cached_count'])},
+                'prompt_eval_cached_count': data['prompt_eval_cached_count'],
+            }
+            if data.get('prompt_eval_cached_count') is not None
+            else {}
+        ),
     }
 
 
