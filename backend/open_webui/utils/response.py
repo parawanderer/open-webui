@@ -304,6 +304,11 @@ async def convert_ollama_stream_to_chat_completions(ollama_streaming_response):
         usage = None
         if done:
             usage = convert_ollama_usage_to_chat_completions(data)
+        elif 'eval_count' in data:
+            # Ollama puts its running count on a chunk only when the request asked
+            # (stream_options.continuous_usage_stats -> stream_metrics). Passed on as usage
+            # on that chunk, which is how vLLM reports it.
+            usage = convert_ollama_usage_to_chat_completions(data)
 
         data = chat_completion_chunk_template(
             model, message_content, reasoning_content, openai_tool_calls, usage, message_id=completion_id
