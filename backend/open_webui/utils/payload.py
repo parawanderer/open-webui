@@ -400,7 +400,8 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
     if 'use' not in hint and task_metadata.get('task'):
         hint['use'] = 'utility'
     if 'session' not in hint and task_metadata.get('chat_id'):
-        hint['session'] = str(task_metadata['chat_id'])
+        # Prefixed so traffic Open WebUI labelled itself is told apart from a client's own ids.
+        hint['session'] = 'owui-' + str(task_metadata['chat_id'])
     if hint:
         ollama_payload['hint'] = hint
 
