@@ -49,12 +49,12 @@ check('a client hint passes through', p.get('hint') == {'use': 'agent', 'session
 p = convert_payload_openai_to_ollama(
     {'model': 'm', 'messages': msgs, 'metadata': {'task': 'query_generation', 'chat_id': 'c-42'}})
 check('a task call is labelled utility, with its chat as session',
-      p.get('hint') == {'use': 'utility', 'session': 'c-42'}, p)
+      p.get('hint') == {'use': 'utility', 'session': 'owui-c-42'}, p)
 p = convert_payload_openai_to_ollama(
     {'model': 'm', 'messages': msgs, 'hint': {'use': 'agent'}, 'metadata': {'task': 'x', 'chat_id': 'c-1'}})
-check('a client use wins over the task label', p.get('hint') == {'use': 'agent', 'session': 'c-1'}, p)
+check('a client use wins over the task label', p.get('hint') == {'use': 'agent', 'session': 'owui-c-1'}, p)
 p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'metadata': {'chat_id': 'c-7'}})
-check('an ordinary chat gets its session, no guessed use', p.get('hint') == {'session': 'c-7'}, p)
+check('an ordinary chat gets its session, no guessed use', p.get('hint') == {'session': 'owui-c-7'}, p)
 p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs})
 check('nothing known, no hint', 'hint' not in p, p)
 
