@@ -3,8 +3,14 @@
 The fork has no test suite, and these patches are overlaid onto the stock image one file at
 a time, so the check runs where they run:
 
-  docker run --rm --entrypoint python -v <fork>/backend/open_webui/utils/payload.py:... \\
-      ghcr.io/open-webui/open-webui:v0.11.3 /checks/ollama_conversion_check.py
+  docker run --rm --entrypoint python -e PYTHONPATH=/app/backend -e WEBUI_SECRET_KEY=throwaway \\
+      -v <fork>/backend/open_webui/utils/payload.py:/app/backend/open_webui/utils/payload.py:ro \\
+      -v <fork>/backend/open_webui/utils/response.py:/app/backend/open_webui/utils/response.py:ro \\
+      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.11.3 \\
+      /checks/ollama_conversion_check.py
+
+Without PYTHONPATH the import fails, and without WEBUI_SECRET_KEY importing Open WebUI refuses
+to start; the value is irrelevant to these checks.
 """
 import asyncio
 import json
@@ -36,6 +42,21 @@ check('other options kept', p['options'].get('temperature') == 0, p)
 
 p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'max_tokens': 12, 'stop': ['x']})
 check('stop and max_tokens coexist', p['options'].get('stop') == ['x'] and p['options'].get('num_predict') == 12, p)
+
+# The request hint: passed through, or filled in from what Open WebUI knows.
+p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'hint': {'use': 'agent', 'session': 's1'}})
+check('a client hint passes through', p.get('hint') == {'use': 'agent', 'session': 's1'}, p)
+p = convert_payload_openai_to_ollama(
+    {'model': 'm', 'messages': msgs, 'metadata': {'task': 'query_generation', 'chat_id': 'c-42'}})
+check('a task call is labelled utility, with its chat as session',
+      p.get('hint') == {'use': 'utility', 'session': 'c-42'}, p)
+p = convert_payload_openai_to_ollama(
+    {'model': 'm', 'messages': msgs, 'hint': {'use': 'agent'}, 'metadata': {'task': 'x', 'chat_id': 'c-1'}})
+check('a client use wins over the task label', p.get('hint') == {'use': 'agent', 'session': 'c-1'}, p)
+p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'metadata': {'chat_id': 'c-7'}})
+check('an ordinary chat gets its session, no guessed use', p.get('hint') == {'session': 'c-7'}, p)
+p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs})
+check('nothing known, no hint', 'hint' not in p, p)
 
 p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs})
 check('no max_tokens, no num_predict', 'num_predict' not in p.get('options', {}), p)
