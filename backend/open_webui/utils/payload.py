@@ -390,6 +390,20 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
     if ollama_payload['stream'] and stream_options.get('continuous_usage_stats'):
         ollama_payload['stream_metrics'] = True
 
+    # ollama's request hint: what the request is for, and which conversation it belongs to.
+    # A client's own hint wins. Otherwise Open WebUI labels what it knows for certain: its own
+    # task-model calls (titles, tags, search queries) are utility work, and the chat id groups a
+    # conversation. It does not guess "interactive" for other requests, since API clients reach
+    # this path too and should say what they are.
+    hint = dict(openai_payload.get('hint') or {})
+    task_metadata = openai_payload.get('metadata') or {}
+    if 'use' not in hint and task_metadata.get('task'):
+        hint['use'] = 'utility'
+    if 'session' not in hint and task_metadata.get('chat_id'):
+        hint['session'] = str(task_metadata['chat_id'])
+    if hint:
+        ollama_payload['hint'] = hint
+
     # If there are advanced parameters in the payload, format them in Ollama's options field
     if openai_payload.get('options'):
         # Copied before key deletions below so the caller's options stay intact
