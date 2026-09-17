@@ -92,6 +92,12 @@ from open_webui.utils.files import (
     get_image_base64_from_url,
     get_image_url_from_base64,
 )
+# slop: the protobuf encoding of this route's stream; see utils/chat_proto.py
+from open_webui.utils.chat_proto import (
+    ChatProtoEncoder,
+    PROTO_CONTENT_TYPE,
+    accepts_proto_stream,
+)
 from open_webui.utils.filter import (
     FilterContext,
     get_filter_context,
@@ -6315,7 +6321,21 @@ async def streaming_chat_response_handler(response, ctx):
         return await response_handler(response, events)
 
     else:
-        # Fallback to the original response
+        # Fallback to the original response.
+        #
+        # This is the branch that produces an HTTP stream. The other one writes to socket.io and
+        # returns nothing, so the browser UI never reaches here -- it is API clients only, which
+        # is why a second wire format can be offered here without the web interface being able to
+        # see the difference.
+        #
+        # slop: when the client negotiated it, the stream is re-encoded as length-delimited
+        # protobuf (utils/chat_proto.py, schema middleware/chat.proto in the ollama fork). That
+        # is the same format ollama serves on its own OpenAI route; this route cannot pass those
+        # bytes through because it is a transcoder, so it encodes them again here.
+        wants_proto, proto_events_ok = accepts_proto_stream(
+            request.headers.getlist('accept') if hasattr(request.headers, 'getlist') else [request.headers.get('accept', '')]
+        )
+
         async def stream_wrapper(original_generator, events):
             def wrap_item(item):
                 return f'data: {item}\n\n'
@@ -6333,6 +6353,15 @@ async def streaming_chat_response_handler(response, ctx):
                 except Exception:
                     has_api_outlet_filters = True
 
+            # slop: the encoding is decided before the first byte and never changes mid-stream.
+            # `events=1` is required, not just `application/protobuf`: an Event frame is field 4
+            # of the Frame oneof, so a decoder generated before it existed skips one silently --
+            # and the frame it would skip is the sources frame. Losing provenance without saying
+            # so is the one failure this stream must not have, so a client that has not said it
+            # reads Event frames gets the SSE it would have got anyway.
+            use_proto = wants_proto and proto_events_ok
+            proto = ChatProtoEncoder(JSONCodec.dumps) if use_proto else None
+
             for event in events:
                 event, _ = await process_filter_functions(
                     request=request,
@@ -6344,10 +6373,13 @@ async def streaming_chat_response_handler(response, ctx):
                 )
 
                 if event:
-                    yield wrap_item(JSONCodec.dumps(event))
+                    yield proto.encode(event) if use_proto else wrap_item(JSONCodec.dumps(event))
 
             async for data in original_generator:
-                if filter_functions:
+                # Today a chunk is parsed only when a filter is installed. Protobuf has to parse
+                # every one: you cannot re-encode what you have not decoded.
+                sse = None
+                if filter_functions or use_proto:
                     line = data.decode('utf-8', 'replace') if isinstance(data, bytes) else data
                     if isinstance(line, str) and line.startswith('data:'):
                         payload = line.removeprefix('data:').strip()
@@ -6358,28 +6390,60 @@ async def streaming_chat_response_handler(response, ctx):
                                 event = None
 
                             if isinstance(event, dict):
-                                event, _ = await process_filter_functions(
-                                    request=request,
-                                    filter_context=filter_context,
-                                    filter_functions=filter_functions,
-                                    filter_type='stream',
-                                    form_data=event,
-                                    extra_params=extra_params,
-                                )
-                                data = wrap_item(JSONCodec.dumps(event)) if event else None
+                                if filter_functions:
+                                    event, _ = await process_filter_functions(
+                                        request=request,
+                                        filter_context=filter_context,
+                                        filter_functions=filter_functions,
+                                        filter_type='stream',
+                                        form_data=event,
+                                        extra_params=extra_params,
+                                    )
+                                if not event:
+                                    data = None
+                                elif use_proto:
+                                    sse = wrap_item(JSONCodec.dumps(event))
+                                    data = proto.encode(event)
+                                else:
+                                    data = wrap_item(JSONCodec.dumps(event))
+                            elif use_proto:
+                                # parsed to something that is not an object, or did not parse at
+                                # all: carried verbatim rather than guessed at or dropped
+                                sse, data = line, proto.encode(payload)
+                        elif use_proto:
+                            # [DONE] has no protobuf form; End closes the stream instead
+                            sse, data = line, proto.encode(payload)
+                    elif use_proto:
+                        # SSE framing (blank separators) is not content; an `event:` line from a
+                        # Responses-API backend is, and is carried whole.
+                        sse = line
+                        data = proto.encode(line) if isinstance(line, str) and line.strip() else None
 
                 if data:
                     if has_api_outlet_filters:
-                        update_assistant_message_from_stream(assistant_message, data)
+                        # bookkeeping for outlet filters reads the SSE form, so it is given the
+                        # SSE form whatever went on the wire
+                        update_assistant_message_from_stream(assistant_message, sse or data)
                     yield data
+
+            if use_proto:
+                yield proto.finish()
 
             if has_api_outlet_filters and assistant_message:
                 ctx['assistant_message'] = assistant_message
                 await outlet_filter_handler(ctx)
 
+        headers = dict(response.headers)
+        if wants_proto and proto_events_ok:
+            # Byte for byte what ollama answers with, so a client cannot have to tell the two
+            # routes apart. Content-Length would be wrong for the re-encoded body; this stream
+            # is chunked and never had one.
+            headers['content-type'] = PROTO_CONTENT_TYPE
+            headers.pop('content-length', None)
+
         return StreamingResponse(
             stream_wrapper(response.body_iterator, events),
-            headers=dict(response.headers),
+            headers=headers,
             background=response.background,
         )
 
