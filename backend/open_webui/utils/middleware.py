@@ -97,6 +97,12 @@ from open_webui.utils.files import (
     get_image_base64_from_url,
     get_image_url_from_base64,
 )
+# slop: the protobuf encoding of this route's stream; see utils/chat_proto.py
+from open_webui.utils.chat_proto import (
+    PROTO_CONTENT_TYPE,
+    encode_sse_stream,
+    accepts_proto_stream,
+)
 from open_webui.utils.filter import (
     FilterContext,
     get_filter_context,
@@ -6605,7 +6611,21 @@ async def streaming_chat_response_handler(response, ctx):
         return await response_handler(response, events)
 
     else:
-        # Fallback to the original response
+        # Fallback to the original response.
+        #
+        # This is the branch that produces an HTTP stream. The other one writes to socket.io and
+        # returns nothing, so the browser UI never reaches here -- it is API clients only, which
+        # is why a second wire format can be offered here without the web interface being able to
+        # see the difference.
+        #
+        # slop: when the client negotiated it, the stream is re-encoded as length-delimited
+        # protobuf (utils/chat_proto.py, schema middleware/chat.proto in the ollama fork). That
+        # is the same format ollama serves on its own OpenAI route; this route cannot pass those
+        # bytes through because it is a transcoder, so it encodes them again here.
+        wants_proto, proto_events_ok = accepts_proto_stream(
+            request.headers.getlist('accept') if hasattr(request.headers, 'getlist') else [request.headers.get('accept', '')]
+        )
+
         async def stream_wrapper(original_generator, events):
             def wrap_item(item):
                 return f'data: {item}\n\n'
@@ -6695,9 +6715,23 @@ async def streaming_chat_response_handler(response, ctx):
             finally:
                 log_model_usage(request, user, form_data['model'], current_usage)
 
+        stream = convert_responses_stream_to_chat_completions(stream_wrapper(response.body_iterator, events))
+        headers = dict(response.headers)
+        # slop: `events=1` is required, not just `application/protobuf`: an Event frame is field 4
+        # of the Frame oneof, so a decoder generated before it existed skips one silently -- and
+        # the frame it would skip is the sources frame. A client that has not said it reads Event
+        # frames gets the SSE it would have got anyway.
+        if wants_proto and proto_events_ok:
+            stream = encode_sse_stream(stream, JSONCodec.dumps, JSONCodec.loads)
+            # Byte for byte what ollama answers with, so a client cannot have to tell the two
+            # routes apart. Content-Length would be wrong for the re-encoded body; this stream
+            # is chunked and never had one.
+            headers['content-type'] = PROTO_CONTENT_TYPE
+            headers.pop('content-length', None)
+
         return StreamingResponse(
-            convert_responses_stream_to_chat_completions(stream_wrapper(response.body_iterator, events)),
-            headers=dict(response.headers),
+            stream,
+            headers=headers,
             background=response.background,
         )
 
