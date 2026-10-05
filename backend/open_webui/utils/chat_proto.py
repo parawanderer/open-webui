@@ -44,6 +44,25 @@ WIRE_VARINT, WIRE_BYTES = 0, 2
 PROTO_CONTENT_TYPE = 'application/protobuf; delimited=varint'
 PROTO_ACCEPT = 'application/protobuf'
 
+# This stream must not be compressed, or it stops being a stream. Open WebUI wraps the whole
+# app in starlette-compress, which lists `application/protobuf` as compressible and exempts
+# only `text/event-stream`. Its streaming compressors write each chunk into zstd/brotli/gzip
+# without flushing, so a few kilobytes of frames sit in the compressor until the response
+# closes and arrive as one read -- for every client that sends Accept-Encoding, which is every
+# browser and Node's fetch. Measured 2026-10-05: one read, zero spread, against ~90 reads for
+# the same generation as SSE. It hit both routes, `/ollama/v1/...` included, because the
+# middleware sits above both. The saving it bought was ~400 bytes on a 1 KB stream.
+#
+# Removed by content type rather than by disabling the middleware, which would uncompress the
+# web UI's assets too. Done at import because the list is module state, read per response;
+# middleware.py imports this module, so it runs before the first request.
+try:
+    from starlette_compress import remove_compress_type
+
+    remove_compress_type(PROTO_ACCEPT)
+except ImportError:  # no compression middleware in this build, so nothing to undo
+    pass
+
 
 def _uvarint(n: int) -> bytes:
     out = bytearray()
