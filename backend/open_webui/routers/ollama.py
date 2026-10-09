@@ -590,6 +590,37 @@ async def get_ollama_info(
     return {}
 
 
+@router.get('/api/fits')
+async def get_ollama_fits(
+    request: Request,
+    user=Depends(get_admin_user),
+):
+    """Ask whether loading a model now would unload anything resident, without loading it.
+
+    `?model=<name>[&num_ctx=<n>]`, answered `{fits, displaces, ...}` by the backend's
+    scheduler. Like /api/info the answer describes one host, so the first enabled backend
+    is asked and its reply, error status included, is returned as it is.
+    """
+    if not await Config.get('ollama.enable'):
+        raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
+
+    base_urls = await Config.get('ollama.base_urls', [])
+    api_configs = await Config.get('ollama.api_configs', {})
+    for idx, url in enumerate(base_urls):
+        api_config = resolve_api_config(api_configs, idx, url)
+        if api_config and not api_config.get('enable', True):
+            continue
+        query = request.url.query
+        return await send_request(
+            f'{url}/api/fits' + (f'?{query}' if query else ''),
+            'GET',
+            key=api_config.get('key') if api_config else None,
+            user=user,
+        )
+
+    raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_NOT_FOUND)
+
+
 @router.get('/api/events')
 async def stream_ollama_events(
     request: Request,
