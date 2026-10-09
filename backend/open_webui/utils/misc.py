@@ -636,23 +636,49 @@ def merge_system_messages(messages: list[dict]) -> list[dict]:
     message at the start.  Multiple pipeline stages may each
     insert their own system message; this function consolidates
     them.
+
+    A system message's content is kept as sent: a list of content parts stays a list, with
+    every part and any per-part field (Anthropic's ``cache_control`` among them). Flattening it
+    to the first text part dropped every later part and the prompt-caching breakpoint, so a
+    client could not cache a Claude system prompt through this route. Only system messages
+    that are all plain strings are joined into one string, as before.
     """
-    system_contents: list[str] = []
+    system_messages: list[dict] = []
     other_messages: list[dict] = []
 
     for message in messages:
         if message.get('role') == 'system':
-            content = get_content_from_message(message)
-            if content:
-                system_contents.append(content)
+            content = message.get('content')
+            if isinstance(content, list) and content:
+                system_messages.append(message)
+            elif text := get_content_from_message(message):
+                system_messages.append({**message, 'content': text})
         else:
             other_messages.append(message)
 
-    if not system_contents:
+    if not system_messages:
         return other_messages
 
-    merged = {'role': 'system', 'content': '\n'.join(system_contents)}
-    return [merged, *other_messages]
+    if len(system_messages) == 1:
+        return [system_messages[0], *other_messages]
+
+    if all(isinstance(m['content'], str) for m in system_messages):
+        merged = {'role': 'system', 'content': '\n'.join(m['content'] for m in system_messages)}
+        return [merged, *other_messages]
+
+    # Strings joined to parts get the newline the all-string join would have given them, on the
+    # string's side, so a client's parts (and the prefix a breakpoint caches) are never edited.
+    # Backends that concatenate parts without a separator, such as the ollama conversion, then
+    # still see the messages apart.
+    parts: list = []
+    last = len(system_messages) - 1
+    for i, m in enumerate(system_messages):
+        if isinstance(m['content'], str):
+            text = ('\n' if i > 0 else '') + m['content'] + ('\n' if i < last else '')
+            parts.append({'type': 'text', 'text': text})
+        else:
+            parts.extend(m['content'])
+    return [{'role': 'system', 'content': parts}, *other_messages]
 
 
 def update_message_content(message: dict, content: str, append: bool = True) -> dict:
