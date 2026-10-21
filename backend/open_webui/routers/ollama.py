@@ -94,6 +94,51 @@ async def send_get_request(
         return None
 
 
+# How often a non-streamed request checks that its client is still there.
+_DISCONNECT_POLL_SECONDS = 0.5
+
+
+def _outlives_its_request(metadata: dict | None) -> bool:
+    """True for work that keeps running after its HTTP response has been sent.
+
+    That is main.py's detached chat task (session_id and chat_id, the same test main.py uses)
+    and the title, tags and follow-up tasks, which carry 'task'. uvicorn answers http.disconnect
+    once the response is complete, so watching these would cancel them as soon as it was sent.
+    """
+    metadata = metadata or {}
+    return bool(metadata.get('task')) or bool(metadata.get('session_id') and metadata.get('chat_id'))
+
+
+async def _unless_disconnected(request: Request | None, aw):
+    """Await *aw*, cancelling it with a 499 if *request*'s client disconnects first.
+
+    uvicorn does not cancel a handler whose client has gone, so a non-streamed generation ran
+    on to num_predict behind a client that had left (a bench cell timeout: 253k tokens, 38 min).
+    Cancelling the aiohttp call closes its connection, and that is what makes ollama stop.
+    A synthetic Request (timers, automations, subagents) has no receive channel; its
+    is_disconnected raises, and the call is then awaited unwatched.
+    """
+    task = asyncio.ensure_future(aw)
+    if request is None:
+        return await task
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
+            if done:
+                return task.result()
+            try:
+                gone = await request.is_disconnected()
+            except RuntimeError:
+                return await task
+            if gone:
+                log.info('Client disconnected; cancelling the upstream ollama request')
+                raise HTTPException(status_code=499, detail='Client disconnected')
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 async def send_request(
     url: str,
     method: str = 'POST',
@@ -134,13 +179,19 @@ async def send_request(
         if api_config and api_config.get('headers'):
             headers.update(await get_custom_headers(api_config['headers'], user, metadata, request=request))
 
-        r = await session.request(
-            method,
-            url,
-            data=payload,
-            headers=headers,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(stream=stream),
+        # Only a non-streamed call needs this: a stream stops when its next write fails.
+        watched = request if not stream and not _outlives_its_request(metadata) else None
+
+        r = await _unless_disconnected(
+            watched,
+            session.request(
+                method,
+                url,
+                data=payload,
+                headers=headers,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(stream=stream),
+            ),
         )
 
         if not r.ok:
@@ -187,7 +238,10 @@ async def send_request(
             )
         else:
             try:
-                return await r.json(loads=JSONCodec.loads)
+                return await _unless_disconnected(watched, r.json(loads=JSONCodec.loads))
+            except HTTPException:
+                r.close()
+                raise
             except Exception:
                 return None
 
