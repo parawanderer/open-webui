@@ -6,7 +6,7 @@ a time, so the check runs where they run:
   docker run --rm --entrypoint python -e PYTHONPATH=/app/backend -e WEBUI_SECRET_KEY=throwaway \\
       -v <fork>/backend/open_webui/utils/payload.py:/app/backend/open_webui/utils/payload.py:ro \\
       -v <fork>/backend/open_webui/utils/response.py:/app/backend/open_webui/utils/response.py:ro \\
-      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.11.3 \\
+      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.13.4 \\
       /checks/ollama_conversion_check.py
 
 Without PYTHONPATH the import fails, and without WEBUI_SECRET_KEY importing Open WebUI refuses
@@ -16,7 +16,7 @@ import asyncio
 import json
 
 from open_webui.utils.payload import convert_payload_openai_to_ollama
-from open_webui.utils.response import convert_streaming_response_ollama_to_openai
+from open_webui.utils.response import convert_ollama_stream_to_chat_completions
 
 failures = []
 
@@ -89,7 +89,7 @@ class Body:
 
 async def convert(chunks):
     out = []
-    async for line in convert_streaming_response_ollama_to_openai(Body(chunks)):
+    async for line in convert_ollama_stream_to_chat_completions(Body(chunks)):
         if line.startswith('data: {'):
             out.append(json.loads(line[len('data: '):]))
     return out
@@ -113,6 +113,77 @@ for c in without[:2]:
     del c['eval_count'], c['prompt_eval_count']
 chunks = asyncio.run(convert(without))
 check('no count asked, no usage mid-stream', all('usage' not in c for c in chunks[:2]), chunks[:2])
+
+# tool_call_deltas (the fork's ollama) become delta.tool_calls fragments, and the whole call
+# that follows is not resent: OpenAI clients join fragments by index.
+def msg(**m):
+    return {'model': 'm', 'message': {'role': 'assistant', 'content': '', **m}, 'done': False}
+
+
+def joined(chunks):
+    calls = {}
+    for c in chunks:
+        for f in c['choices'][0]['delta'].get('tool_calls', []):
+            e = calls.setdefault(f['index'], {'id': None, 'name': None, 'arguments': '', 'n': 0})
+            e['id'] = e['id'] or f.get('id')
+            e['name'] = e['name'] or f.get('function', {}).get('name')
+            e['arguments'] += f['function'].get('arguments', '')
+            e['n'] += 1
+    return calls
+
+
+whole = {'id': 'call_a', 'function': {'index': 0, 'name': 'write_file', 'arguments': {'path': 'p.py', 'content': 'x<y'}}}
+done = {'model': 'm', 'message': {'role': 'assistant', 'content': ''}, 'done': True, 'done_reason': 'stop'}
+GO = '{"path":"p.py","content":"x\\u003cy"}'  # json.Marshal of the arguments
+
+# Go-parser path: pieces are a prefix of the whole call's JSON; the rest goes out at close.
+prefix = [
+    msg(content='ok'),
+    msg(tool_call_deltas=[{'index': 0, 'id': 'call_a', 'function': {'name': 'write_file', 'arguments': '{"path":'}}]),
+    msg(tool_call_deltas=[{'index': 0, 'function': {'arguments': '"p.py"'}}]),
+    msg(tool_call_deltas=[{'index': 0, 'function': {'arguments': ',"content":"x'}}]),
+    msg(tool_calls=[whole]),
+    done,
+]
+chunks = asyncio.run(convert(prefix))
+calls = joined(chunks)
+check('pieces stream as fragments, rest appended at close',
+      calls[0]['arguments'] == GO, calls)
+check('id and name once, on the first fragment', calls[0]['id'] == 'call_a' and calls[0]['name'] == 'write_file'
+      and sum(1 for c in chunks for f in c['choices'][0]['delta'].get('tool_calls', []) if 'id' in f) == 1, chunks)
+check('fragment count: 3 pieces + 1 rest', calls[0]['n'] == 4, calls)
+check('no finish_reason stop mid-stream', all(c['choices'][0].get('finish_reason') is None for c in chunks[:-1]),
+      [c['choices'][0].get('finish_reason') for c in chunks])
+check('finish_reason tool_calls at done', chunks[-1]['choices'][0]['finish_reason'] == 'tool_calls', chunks[-1])
+
+# llama-server path: pieces are llama.cpp's bytes, the whole call a re-marshal; pieces stand.
+llama = [
+    msg(tool_call_deltas=[{'index': 0, 'id': 'call_a', 'function': {'name': 'write_file', 'arguments': '{"path": "p.py", '}}]),
+    msg(tool_call_deltas=[{'index': 0, 'function': {'arguments': '"content": "x<y"}'}}]),
+    msg(tool_calls=[whole]),
+    done,
+]
+chunks = asyncio.run(convert(llama))
+calls = joined(chunks)
+check('diverging bytes: the pieces are the call', calls[0]['arguments'] == '{"path": "p.py", "content": "x<y"}', calls)
+check('diverging bytes: whole call not resent', calls[0]['n'] == 2, calls)
+check('no empty mid-stream chunk', len(chunks) == 3, len(chunks))
+
+# A call with no deltas still goes out whole; a second parallel call is kept apart by index.
+second = {'id': 'call_b', 'function': {'index': 1, 'name': 'ls', 'arguments': {}}}
+chunks = asyncio.run(convert([
+    msg(tool_call_deltas=[{'index': 0, 'id': 'call_a', 'function': {'name': 'write_file', 'arguments': '{"path":"p.py"'}}]),
+    msg(tool_calls=[whole, second]),
+    done,
+]))
+calls = joined(chunks)
+check('an unstreamed call goes out whole', calls[1] == {'id': 'call_b', 'name': 'ls', 'arguments': '{}', 'n': 1}, calls)
+check('the streamed one is completed', calls[0]['arguments'] == GO, calls)
+
+# No deltas at all: unchanged behaviour.
+chunks = asyncio.run(convert([msg(tool_calls=[whole]), done]))
+calls = joined(chunks)
+check('plain whole call unchanged', calls[0]['n'] == 1 and calls[0]['id'] == 'call_a', calls)
 
 print(f'\n{len(failures)} failure(s)')
 raise SystemExit(1 if failures else 0)
