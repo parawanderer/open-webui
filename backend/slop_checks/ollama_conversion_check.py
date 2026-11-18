@@ -15,7 +15,7 @@ to start; the value is irrelevant to these checks.
 import asyncio
 import json
 
-from open_webui.utils.payload import convert_payload_openai_to_ollama
+from open_webui.utils.payload import convert_chat_completions_payload_to_ollama
 from open_webui.utils.response import convert_ollama_stream_to_chat_completions
 
 failures = []
@@ -30,44 +30,44 @@ def check(name, cond, detail=''):
 msgs = [{'role': 'user', 'content': 'hi'}]
 
 # max_tokens must reach ollama as options.num_predict; at the root it is ignored.
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'max_tokens': 12})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs, 'max_tokens': 12})
 check('max_tokens lands in options.num_predict', p.get('options', {}).get('num_predict') == 12, p)
 check('max_tokens not left at the root', 'num_predict' not in p and 'max_tokens' not in p, p)
 
-p = convert_payload_openai_to_ollama(
+p = convert_chat_completions_payload_to_ollama(
     {'model': 'm', 'messages': msgs, 'max_tokens': 12, 'options': {'num_predict': 50, 'temperature': 0}}
 )
 check('an explicit options.num_predict wins', p['options']['num_predict'] == 50, p)
 check('other options kept', p['options'].get('temperature') == 0, p)
 
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'max_tokens': 12, 'stop': ['x']})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs, 'max_tokens': 12, 'stop': ['x']})
 check('stop and max_tokens coexist', p['options'].get('stop') == ['x'] and p['options'].get('num_predict') == 12, p)
 
 # The request hint: passed through, or filled in from what Open WebUI knows.
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'hint': {'use': 'agent', 'session': 's1'}})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs, 'hint': {'use': 'agent', 'session': 's1'}})
 check('a client hint passes through', p.get('hint') == {'use': 'agent', 'session': 's1'}, p)
-p = convert_payload_openai_to_ollama(
+p = convert_chat_completions_payload_to_ollama(
     {'model': 'm', 'messages': msgs, 'metadata': {'task': 'query_generation', 'chat_id': 'c-42'}})
 check('a task call is labelled utility, with its chat as session',
       p.get('hint') == {'use': 'utility', 'session': 'owui-c-42'}, p)
-p = convert_payload_openai_to_ollama(
+p = convert_chat_completions_payload_to_ollama(
     {'model': 'm', 'messages': msgs, 'hint': {'use': 'agent'}, 'metadata': {'task': 'x', 'chat_id': 'c-1'}})
 check('a client use wins over the task label', p.get('hint') == {'use': 'agent', 'session': 'owui-c-1'}, p)
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'metadata': {'chat_id': 'c-7'}})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs, 'metadata': {'chat_id': 'c-7'}})
 check('an ordinary chat gets its session, no guessed use', p.get('hint') == {'session': 'owui-c-7'}, p)
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs})
 check('nothing known, no hint', 'hint' not in p, p)
 
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs})
 check('no max_tokens, no num_predict', 'num_predict' not in p.get('options', {}), p)
 
 # continuous_usage_stats -> stream_metrics, only for a streamed request
 opts = {'include_usage': True, 'continuous_usage_stats': True}
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'stream': True, 'stream_options': opts})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs, 'stream': True, 'stream_options': opts})
 check('continuous_usage_stats sets stream_metrics', p.get('stream_metrics') is True, p)
-p = convert_payload_openai_to_ollama({'model': 'm', 'messages': msgs, 'stream': False, 'stream_options': opts})
+p = convert_chat_completions_payload_to_ollama({'model': 'm', 'messages': msgs, 'stream': False, 'stream_options': opts})
 check('not for a non-streamed request', 'stream_metrics' not in p, p)
-p = convert_payload_openai_to_ollama(
+p = convert_chat_completions_payload_to_ollama(
     {'model': 'm', 'messages': msgs, 'stream': True, 'stream_options': {'include_usage': True}}
 )
 check('include_usage alone does not', 'stream_metrics' not in p, p)

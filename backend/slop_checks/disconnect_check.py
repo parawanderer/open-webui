@@ -2,7 +2,7 @@
 
   docker run --rm --entrypoint python -e PYTHONPATH=/app/backend -e WEBUI_SECRET_KEY=throwaway \\
       -v <fork>/backend/open_webui/routers/ollama.py:/app/backend/open_webui/routers/ollama.py:ro \\
-      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.11.4 \\
+      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.13.4 \\
       /checks/disconnect_check.py
 
 A raw asyncio server stands in for ollama: it answers after 2 s, and records when the connection

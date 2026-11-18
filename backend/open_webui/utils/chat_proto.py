@@ -355,15 +355,20 @@ async def encode_sse_stream(sse_stream, dumps, loads):
     frame arrives here as an ordinary `data:` payload, so it goes out as an Event frame, and
     End closes the stream either way.
     """
+    import codecs
+
     proto = ChatProtoEncoder(dumps)
+    # Incremental: a chunk boundary can fall inside a multi-byte character.
+    decoder = codecs.getincrementaldecoder('utf-8')('replace')
     buf = ''
     async for chunk in sse_stream:
-        buf += chunk.decode('utf-8', 'replace') if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+        buf += decoder.decode(chunk) if isinstance(chunk, (bytes, bytearray)) else str(chunk)
         *lines, buf = buf.split('\n')
         for line in lines:
             out = _encode_sse_line(proto, line.rstrip('\r'), loads)
             if out:
                 yield out
+    buf += decoder.decode(b'', final=True)
     if buf.strip():
         out = _encode_sse_line(proto, buf.rstrip('\r'), loads)
         if out:

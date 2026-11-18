@@ -5,7 +5,7 @@ other parts and Anthropic's cache_control breakpoint on every /api/chat/completi
 
   docker run --rm --entrypoint python -e PYTHONPATH=/app/backend -e WEBUI_SECRET_KEY=throwaway \\
       -v <fork>/backend/open_webui/utils/misc.py:/app/backend/open_webui/utils/misc.py:ro \\
-      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.11.4 \\
+      -v <fork>/backend/slop_checks:/checks:ro ghcr.io/open-webui/open-webui:v0.13.4 \\
       /checks/system_message_check.py
 """
 from open_webui.utils.misc import merge_system_messages
@@ -47,9 +47,9 @@ check(
     out,
 )
 
-from open_webui.utils.payload import convert_messages_openai_to_ollama
+from open_webui.utils.payload import convert_chat_completions_messages_to_ollama
 
-ollama = convert_messages_openai_to_ollama(merge_system_messages([{'role': 'system', 'content': parts}, {'role': 'system', 'content': 'RAG'}, user]))
+ollama = convert_chat_completions_messages_to_ollama(merge_system_messages([{'role': 'system', 'content': parts}, {'role': 'system', 'content': 'RAG'}, user]))
 check('ollama still sees the merged system text apart', ollama[0]['content'] == 'AAABBB\nRAG', ollama)
 
 out = merge_system_messages([{'role': 'system', 'content': ''}, user])

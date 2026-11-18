@@ -201,6 +201,42 @@ for header, want_proto, want_events in cases:
 
 check('no Accept header at all is SSE', accepts_proto_stream([]) == (False, False))
 
+# encode_sse_stream (0.13 rebase): the encoding is an outer layer over the finished SSE stream.
+# Fed SSE split at arbitrary byte boundaries, it must produce exactly what the encoder gives
+# when fed the parsed payloads directly, and close with End.
+import asyncio as _asyncio
+_payloads = [
+    {'id': 'c1', 'model': 'm', 'created': 1, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': 'Hé'}}]},
+    {'sources': [{'url': 'u'}]},
+    {'id': 'c1', 'model': 'm', 'created': 1, 'choices': [{'index': 0, 'delta': {'tool_calls': [
+        {'index': 0, 'id': 'call_a', 'type': 'function', 'function': {'name': 'f', 'arguments': '{"a":'}}]}}]},
+    {'id': 'c1', 'model': 'm', 'created': 1, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}],
+     'usage': {'prompt_tokens': 3, 'completion_tokens': 5}},
+    {'error': {'message': 'Chat completion stream failed'}},
+]
+_dumps = lambda o: json.dumps(o, ensure_ascii=False)  # raw UTF-8, as JSONCodec writes it
+_sse = ''.join(f'data: {_dumps(p)}\n\n' for p in _payloads) + 'event: response.created\n: comment\ndata: not json\n\ndata: [DONE]\n\n'
+_want_enc = _mod.ChatProtoEncoder(json.dumps)
+_want = b''.join(_want_enc.encode(p) for p in _payloads) + _want_enc.encode('event: response.created') \
+    + _want_enc.encode('not json') + _want_enc.finish()
+_raw = _sse.encode()
+
+
+async def _collect(chunks):
+    async def gen():
+        for c in chunks:
+            yield c
+    return b''.join([f async for f in _mod.encode_sse_stream(gen(), json.dumps, json.loads)])
+
+
+for _size in (1, 2, 7, 64, len(_raw)):
+    _chunks = [_raw[i:i + _size] for i in range(0, len(_raw), _size)]
+    # 1- and 7-byte chunks split the two-byte 'é'
+    _got = _asyncio.run(_collect(_chunks))
+    check(f'encode_sse_stream, {_size}-byte chunks, equals direct encoding', _got == _want, (len(_got), len(_want)))
+_got = _asyncio.run(_collect([_sse]))
+check('encode_sse_stream accepts str chunks', _got == _want)
+
 print()
 print(f'{len(failures)} failure(s)' if failures else 'all checks passed')
 raise SystemExit(1 if failures else 0)
