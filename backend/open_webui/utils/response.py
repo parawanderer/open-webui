@@ -1,3 +1,5 @@
+import json
+import logging
 from numbers import Number
 from uuid import uuid4
 
@@ -70,6 +72,8 @@ USAGE_DETAIL_KEYS = {
     'input_tokens_details',
     'output_tokens_details',
 }
+
+log = logging.getLogger(__name__)
 
 
 def _is_numeric_usage_value(value) -> bool:
@@ -238,11 +242,78 @@ def convert_response_ollama_to_openai(ollama_response: dict) -> dict:
     return response
 
 
+def _fold_ollama_tool_call_deltas(deltas: list, streamed: dict) -> list:
+    """The fork's ollama sends message.tool_call_deltas while a call is being written
+    ([{index, id?, function: {name?, arguments}}]; the first piece for an index carries id and
+    name). Each piece becomes an OpenAI delta.tool_calls fragment: the first with id, type and
+    name, later ones with only index and arguments. `streamed` keeps, per index, the id and the
+    arguments sent so far, so the whole call that follows can be folded away."""
+    fragments = []
+    for delta in deltas:
+        function = delta.get('function') or {}
+        index = delta.get('index', 0)
+        piece = function.get('arguments') or ''
+        state = streamed.get(index)
+        if state is None:
+            state = streamed[index] = {'id': delta.get('id') or f'call_{str(uuid4())}', 'arguments': ''}
+            fragment = {
+                'index': index,
+                'id': state['id'],
+                'type': 'function',
+                'function': {'name': function.get('name', ''), 'arguments': piece},
+            }
+        elif piece:
+            fragment = {'index': index, 'function': {'arguments': piece}}
+        else:
+            continue
+        state['arguments'] += piece
+        fragments.append(fragment)
+    return fragments
+
+
+def _go_json(value) -> str:
+    """The bytes Go's json.Marshal writes, which is what ollama's own parsers stream: compact,
+    UTF-8 kept, and <, >, &, U+2028, U+2029 escaped."""
+    out = json.dumps(value, separators=(',', ':'), ensure_ascii=False)
+    for ch, esc in (('<', '\\u003c'), ('>', '\\u003e'), ('&', '\\u0026'), ('\u2028', '\\u2028'), ('\u2029', '\\u2029')):
+        out = out.replace(ch, esc)
+    return out
+
+
+def _fold_ollama_whole_tool_calls(tool_calls: list, openai_tool_calls: list, streamed: dict) -> list:
+    """OpenAI streaming has no "here is the whole call again": the client joins fragments by
+    index. So a whole call whose index already streamed is not resent. If the pieces already
+    parse to the call (ollama's llama-server path: llama.cpp's bytes, the whole call a Go
+    re-marshal), they stand. If they are a prefix of the call's Go JSON (ollama's own parsers),
+    only the rest goes out. Otherwise they stand as sent. This mirrors ollama's /v1 writer."""
+    out = []
+    for raw, call in zip(tool_calls, openai_tool_calls):
+        state = streamed.get(call['index'])
+        if state is None:
+            out.append(call)
+            continue
+        arguments = (raw.get('function') or {}).get('arguments', {})
+        try:
+            if json.loads(state['arguments']) == arguments:
+                continue
+        except ValueError:
+            pass
+        whole = _go_json(arguments)
+        if whole.startswith(state['arguments']) and len(whole) > len(state['arguments']):
+            rest = whole[len(state['arguments']):]
+            state['arguments'] = whole
+            out.append({'index': call['index'], 'function': {'arguments': rest}})
+        else:
+            log.warning('ollama tool call %s: streamed arguments are not a prefix of the whole call', call['index'])
+    return out
+
+
 async def convert_streaming_response_ollama_to_openai(ollama_streaming_response):
     has_tool_calls = False
     # All chunks in a single completion must share the same id (OpenAI spec).
     completion_id = f'chatcmpl-{str(uuid4())}'
     first = True
+    streamed_tool_calls = {}
     async for data in ollama_streaming_response.body_iterator:
         data = JSONCodec.loads(data)
 
@@ -251,13 +322,32 @@ async def convert_streaming_response_ollama_to_openai(ollama_streaming_response)
         message_content = message.get('content', None)
         reasoning_content = message.get('thinking', None)
         tool_calls = message.get('tool_calls', None)
-        openai_tool_calls = None
+        tool_call_deltas = message.get('tool_call_deltas', None)
+        openai_tool_calls = []
+
+        if tool_call_deltas:
+            openai_tool_calls += _fold_ollama_tool_call_deltas(tool_call_deltas, streamed_tool_calls)
 
         if tool_calls:
-            openai_tool_calls = convert_ollama_tool_call_to_openai(tool_calls)
+            openai_tool_calls += _fold_ollama_whole_tool_calls(
+                tool_calls, convert_ollama_tool_call_to_openai(tool_calls), streamed_tool_calls
+            )
             has_tool_calls = True
 
         done = data.get('done', False)
+
+        # A chunk whose tool-call content folded away to nothing is skipped: sent empty, the
+        # template would mark it finish_reason 'stop' mid-stream.
+        if (
+            (tool_call_deltas or tool_calls)
+            and not openai_tool_calls
+            and not message_content
+            and not reasoning_content
+            and not done
+            and 'eval_count' not in data
+            and not first
+        ):
+            continue
 
         usage = None
         if done:
@@ -269,7 +359,7 @@ async def convert_streaming_response_ollama_to_openai(ollama_streaming_response)
             usage = convert_ollama_usage_to_openai(data)
 
         data = openai_chat_chunk_message_template(
-            model, message_content, reasoning_content, openai_tool_calls, usage, message_id=completion_id
+            model, message_content, reasoning_content, openai_tool_calls or None, usage, message_id=completion_id
         )
 
         # First chunk must carry delta.role (OpenAI spec).
